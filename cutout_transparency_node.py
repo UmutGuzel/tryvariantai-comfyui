@@ -1,125 +1,156 @@
+from __future__ import annotations
+
 import torch
 import numpy as np
-from scipy.ndimage import gaussian_filter
-import torch.nn.functional as F
+from typing import Any
+
+
+def detect_white_areas(img_np: np.ndarray, threshold: float) -> np.ndarray:
+    """
+    Shared white detection logic with color uniformity check.
+
+    Detects only actual white/gray areas by ensuring:
+    1. All RGB channels are above threshold (brightness check)
+    2. All RGB channels are similar to each other (uniformity check)
+
+    This prevents accidentally removing bright colored areas (like bright red, blue, green)
+    and ensures image integrity by only targeting genuine white/gray regions.
+
+    Args:
+        img_np: Numpy array of images (B, H, W, C)
+        threshold: Float threshold for white detection (0.0-1.0)
+
+    Returns:
+        Numpy array of masks (B, H, W) with white areas marked as 1, others as 0
+    """
+    if len(img_np.shape) == 4:
+        batch_size: int = img_np.shape[0]
+    else:
+        img_np = np.expand_dims(img_np, 0)
+        batch_size = 1
+
+    masks: list[np.ndarray] = []
+
+    for i in range(batch_size):
+        img: np.ndarray = img_np[i]
+
+        # Brightness check: all RGB channels must be above threshold
+        is_bright: np.ndarray = np.all(img >= threshold, axis=2)
+
+        # Uniformity check: RGB channels must be similar (within 5% of each other)
+        max_channel: np.ndarray = np.max(img, axis=2)
+        min_channel: np.ndarray = np.min(img, axis=2)
+        channel_diff: np.ndarray = max_channel - min_channel
+        is_uniform: np.ndarray = channel_diff < 0.05
+
+        # White detection: must be both bright AND uniform
+        white_mask: np.ndarray = np.where(is_bright & is_uniform, 1.0, 0.0).astype(np.float32)
+        masks.append(white_mask)
+
+    return np.stack(masks)
+
 
 class WhiteToTransparentNode:
     """
-    A ComfyUI node that makes solid white parts of an image transparent using a mask.
+    A ComfyUI node that makes solid white parts of an image transparent.
     Outputs an RGBA image with transparency where white areas are detected.
     """
-    
+
+    RETURN_TYPES: tuple[str, ...] = ("IMAGE", "MASK")
+    RETURN_NAMES: tuple[str, ...] = ("rgba_image", "transparency_mask")
+    FUNCTION: str = "make_white_transparent"
+    CATEGORY: str = "TryVariant.ai/postprocessing"
+    DESCRIPTION: str = "Makes white parts of an image transparent (binary 0 or 1). Optionally use a mask to control where white detection is applied."
+
     @classmethod
-    def INPUT_TYPES(cls):
+    def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
             "required": {
                 "image": ("IMAGE",),
-                "mask": ("MASK",),
                 "threshold": ("FLOAT", {
-                    "default": 0.95, 
-                    "min": 0.0, 
-                    "max": 1.0, 
+                    "default": 0.95,
+                    "min": 0.0,
+                    "max": 1.0,
                     "step": 0.01,
                     "display": "slider"
                 }),
-                "feather": ("INT", {
-                    "default": 0,
-                    "min": 0,
-                    "max": 50,
-                    "step": 1,
-                    "display": "slider"
-                }),
+            },
+            "optional": {
+                "mask": ("MASK",),
                 "invert_mask": ("BOOLEAN", {"default": False}),
             }
         }
-    
-    RETURN_TYPES = ("IMAGE", "MASK")
-    RETURN_NAMES = ("rgba_image", "transparency_mask")
-    FUNCTION = "make_white_transparent"
-    CATEGORY = "TryVariant.ai/postprocessing"
-    DESCRIPTION = "Makes white parts of an image transparent based on a mask. Outputs RGBA image with alpha channel."
 
-    def make_white_transparent(self, image, mask, threshold=0.95, feather=0, invert_mask=False):
+    def make_white_transparent(self, image: torch.Tensor, threshold: float = 0.95, mask: torch.Tensor | None = None, invert_mask: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
         # Keep tensors on their original device
-        device = image.device
-        
-        # Get mask dimensions (target dimensions)
-        mask_h = mask.shape[1]
-        mask_w = mask.shape[2]
-        print(mask.shape)
-        print(image.shape)
-        # Check if image needs resizing to match mask
-        if image.shape[1] != mask_h or image.shape[2] != mask_w:
-            # Resize image to match mask dimensions
-            # F.interpolate expects (B, C, H, W) format
-            
-            image_resized = image.permute(0, 3, 1, 2)  # (B, H, W, C) -> (B, C, H, W)
-            image_resized = F.interpolate(image_resized, size=(mask_h, mask_w), mode='nearest', align_corners=False)
-            image = image_resized.permute(0, 2, 3, 1)  # (B, C, H, W) -> (B, H, W, C)
+        device: torch.device = image.device
 
         # Ensure correct dimensions
         if len(image.shape) == 3:
             image = image.unsqueeze(0)
-        if len(mask.shape) == 2:
-            mask = mask.unsqueeze(0).unsqueeze(-1)
-        elif len(mask.shape) == 3 and mask.shape[-1] != 1:
-            mask = mask.unsqueeze(-1)
-        
-        batch_size = image.shape[0]
-        
+
+        batch_size: int = image.shape[0]
+
         # Convert to numpy for processing
-        img_np = image.cpu().numpy()
-        mask_np = mask.cpu().numpy()
-        
+        img_np: np.ndarray = image.cpu().numpy()
+
+        # Handle optional mask
+        mask_np: np.ndarray | None = None
+        if mask is not None:
+            mask_np = mask.cpu().numpy()
+            # Ensure mask has batch dimension
+            if len(mask_np.shape) == 2:
+                mask_np = np.expand_dims(mask_np, 0)
+
+        # Detect white areas using shared logic
+        white_masks: np.ndarray = detect_white_areas(img_np, threshold)
+
         # Process each image in batch
-        processed_images = []
-        final_masks = []
-        
+        processed_images: list[np.ndarray] = []
+        final_masks: list[np.ndarray] = []
+
         for i in range(batch_size):
-            # Get current image and mask
-            img = img_np[i]
-            msk = mask_np[i] if i < mask_np.shape[0] else mask_np[0]
-            
-            # Ensure mask is 2D
-            if len(msk.shape) == 3:
-                msk = msk[:, :, 0]
-            
-            # Invert mask if requested
-            if invert_mask:
-                msk = 1.0 - msk
-            
-            # Detect white pixels (all channels above threshold)
-            white_mask = np.all(img >= threshold, axis=2).astype(np.float32)
-            
-            # Combine with input mask - only make white pixels transparent where mask allows
-            transparency_mask = white_mask * msk
-            
-            # Apply feathering if requested for smoother edges
-            if feather > 0:
-                transparency_mask = gaussian_filter(transparency_mask, sigma=feather)
-                transparency_mask = np.clip(transparency_mask, 0, 1)
-            
+            # Get current image
+            img: np.ndarray = img_np[i]
+            white_mask: np.ndarray = white_masks[i]
+
+            # Apply mask if provided
+            transparency_mask: np.ndarray
+            if mask_np is not None:
+                msk: np.ndarray = mask_np[i] if i < mask_np.shape[0] else mask_np[0]
+
+                # Invert mask if requested
+                if invert_mask:
+                    msk = 1.0 - msk
+
+                # Combine white detection with mask (result remains binary 0 or 1)
+                transparency_mask = white_mask * msk
+                # Ensure binary values after mask combination
+                transparency_mask = np.where(transparency_mask > 0.5, 1.0, 0.0)
+            else:
+                # Use white detection directly (already binary 0 or 1)
+                transparency_mask = white_mask
+
             # Create RGBA image
-            rgba = np.zeros((img.shape[0], img.shape[1], 4), dtype=np.float32)
-            
+            rgba: np.ndarray = np.zeros((img.shape[0], img.shape[1], 4), dtype=np.float32)
+
             # Copy RGB channels
             rgba[:, :, :3] = img
-            
+
             # Set alpha channel (1 = opaque, 0 = transparent)
-            # Where we detected white (transparency_mask = 1), alpha should be 0 (transparent)
             rgba[:, :, 3] = 1.0 - transparency_mask
-            
+
             processed_images.append(rgba)
             final_masks.append(transparency_mask)
-        
+
         # Convert back to tensors
-        output_images = np.stack(processed_images)
-        output_masks = np.stack(final_masks)
-        
-        # Ensure masks have correct shape (B, H, W, 1)
-        if len(output_masks.shape) == 3:
-            output_masks = np.expand_dims(output_masks, -1)
-        
+        output_images: np.ndarray = np.stack(processed_images)
+        output_masks: np.ndarray = np.stack(final_masks)
+
+        # Ensure masks have correct 2D shape (B, H, W) - no channel dimension
+        if len(output_masks.shape) == 4:
+            output_masks = output_masks[:, :, :, 0]
+
         # Move back to original device
         return (torch.from_numpy(output_images).to(device), torch.from_numpy(output_masks).to(device))
 
@@ -128,9 +159,15 @@ class SimpleWhiteDetectorNode:
     """
     A simple node that detects white areas in an image and creates a mask.
     """
-    
+
+    RETURN_TYPES: tuple[str, ...] = ("MASK",)
+    RETURN_NAMES: tuple[str, ...] = ("white_areas_mask",)
+    FUNCTION: str = "detect_white"
+    CATEGORY: str = "TryVariant.ai/postprocessing"
+    DESCRIPTION: str = "Detects white areas in an image and creates a mask."
+
     @classmethod
-    def INPUT_TYPES(cls):
+    def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
             "required": {
                 "image": ("IMAGE",),
@@ -143,40 +180,19 @@ class SimpleWhiteDetectorNode:
                 }),
             }
         }
-    
-    RETURN_TYPES = ("MASK",)
-    RETURN_NAMES = ("white_areas_mask",)
-    FUNCTION = "detect_white"
-    CATEGORY = "TryVariant.ai/postprocessing"
-    DESCRIPTION = "Detects white areas in an image and creates a mask."
 
-    def detect_white(self, image, threshold=0.95):
+    def detect_white(self, image: torch.Tensor, threshold: float = 0.95) -> tuple[torch.Tensor]:
         # Keep track of device
-        device = image.device
-        
-        # Convert tensor to numpy
-        img_np = image.cpu().numpy()
-        
-        if len(img_np.shape) == 4:
-            batch_size = img_np.shape[0]
-        else:
-            img_np = np.expand_dims(img_np, 0)
-            batch_size = 1
-        
-        masks = []
-        
-        for i in range(batch_size):
-            img = img_np[i]
-            
-            # Detect white pixels (all RGB channels above threshold)
-            white_mask = np.all(img >= threshold, axis=2).astype(np.float32)
-            
-            masks.append(white_mask)
-        
-        # Convert back to tensor
-        output_masks = np.stack(masks)
-        if len(output_masks.shape) == 3:
-            output_masks = np.expand_dims(output_masks, -1)
-        
-        return (torch.from_numpy(output_masks).to(device),)
+        device: torch.device = image.device
 
+        # Convert tensor to numpy
+        img_np: np.ndarray = image.cpu().numpy()
+
+        # Use shared white detection logic
+        output_masks: np.ndarray = detect_white_areas(img_np, threshold)
+
+        # Ensure 2D mask format (B, H, W) - no channel dimension
+        if len(output_masks.shape) == 4:
+            output_masks = output_masks[:, :, :, 0]
+
+        return (torch.from_numpy(output_masks).to(device),)
