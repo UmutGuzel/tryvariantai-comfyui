@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
-import numpy as np
-import cv2
 from typing import Any
+
+from .gpu_ops import gpu_dilate, gpu_gaussian_blur
 
 
 class MaskExpandBorder:
@@ -42,45 +41,12 @@ class MaskExpandBorder:
             }
         }
 
+    @torch.inference_mode()
     def expand_mask_border(self, mask: torch.Tensor, expand_pixels: int, iterations: int, kernel_shape: str) -> tuple[torch.Tensor]:
-        # Ensure mask is in the right format
         if mask.dim() == 2:
-            mask = mask.unsqueeze(0)  # Add batch dimension
+            mask = mask.unsqueeze(0)
 
-        batch_size: int = mask.shape[0]
-        height: int = mask.shape[1]
-        width: int = mask.shape[2]
-        expanded_masks: list[torch.Tensor] = []
-
-        # Create morphological kernel
-        kernel_size: int = expand_pixels * 2 + 1
-
-        kernel: np.ndarray
-        if kernel_shape == "ellipse":
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-        elif kernel_shape == "rectangle":
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
-        else:  # cross
-            kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (kernel_size, kernel_size))
-
-        # Process each mask in the batch
-        for i in range(batch_size):
-            # Convert mask to numpy array (0-255 range)
-            mask_np: np.ndarray = (mask[i].cpu().numpy() * 255).astype(np.uint8)
-
-            # Apply morphological dilation
-            expanded_mask_np: np.ndarray = cv2.dilate(mask_np, kernel, iterations=iterations)
-
-            # Convert back to tensor (0-1 range)
-            expanded_mask: torch.Tensor = torch.from_numpy(expanded_mask_np.astype(np.float32) / 255.0)
-
-            # Move to same device as input
-            expanded_mask = expanded_mask.to(mask.device)
-            expanded_masks.append(expanded_mask)
-
-        # Stack all masks back together
-        result: torch.Tensor = torch.stack(expanded_masks, dim=0)
-
+        result: torch.Tensor = gpu_dilate(mask, expand_pixels, expand_pixels, kernel_shape, iterations)
         return (result,)
 
 
@@ -122,50 +88,39 @@ class MaskExpandBorderAdvanced:
             }
         }
 
+    @torch.inference_mode()
     def expand_mask_border_advanced(self, mask: torch.Tensor, expand_pixels: int, method: str, kernel_shape: str, feather_amount: float) -> tuple[torch.Tensor]:
         if mask.dim() == 2:
             mask = mask.unsqueeze(0)
 
-        batch_size: int = mask.shape[0]
-        height: int = mask.shape[1]
-        width: int = mask.shape[2]
-        expanded_masks: list[torch.Tensor] = []
+        device: torch.device = mask.device
 
-        for i in range(batch_size):
-            mask_np: np.ndarray = (mask[i].cpu().numpy() * 255).astype(np.uint8)
+        result: torch.Tensor
+        if method == "dilation":
+            result = gpu_dilate(mask, expand_pixels, expand_pixels, kernel_shape, iterations=1)
 
-            expanded_mask_np: np.ndarray
-            if method == "dilation":
-                kernel_size: int = expand_pixels * 2 + 1
-                kernel: np.ndarray
-                if kernel_shape == "ellipse":
-                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-                elif kernel_shape == "rectangle":
-                    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
-                else:  # cross
-                    kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (kernel_size, kernel_size))
+        elif method == "gaussian_blur":
+            blur_size: int = expand_pixels * 2 + 1
+            blurred: torch.Tensor = gpu_gaussian_blur(mask, blur_size)
+            result = (blurred > 0.498).float()
 
-                expanded_mask_np = cv2.dilate(mask_np, kernel, iterations=1)
+        elif method == "distance_transform":
+            # CPU fallback — no GPU equivalent, rarely used
+            import cv2
+            import numpy as np
+            results: list[torch.Tensor] = []
+            for i in range(mask.shape[0]):
+                mask_np: np.ndarray = (mask[i].cpu().numpy() * 255).astype(np.uint8)
+                dist: np.ndarray = cv2.distanceTransform(mask_np, cv2.DIST_L2, 5)
+                expanded: np.ndarray = ((dist > 0) | (dist <= expand_pixels)).astype(np.uint8) * 255
+                results.append(torch.from_numpy(expanded.astype(np.float32) / 255.0))
+            result = torch.stack(results).to(device)
+        else:
+            result = mask
 
-            elif method == "gaussian_blur":
-                # Create a blurred version and threshold it
-                blurred: np.ndarray = cv2.GaussianBlur(mask_np, (expand_pixels * 2 + 1, expand_pixels * 2 + 1), 0)
-                _, expanded_mask_np = cv2.threshold(blurred, 127, 255, cv2.THRESH_BINARY)
+        # Apply feathering if requested
+        if feather_amount > 0:
+            feather_size: int = int(feather_amount * 2) * 2 + 1
+            result = gpu_gaussian_blur(result, feather_size, sigma=feather_amount)
 
-            elif method == "distance_transform":
-                # Use distance transform for smoother expansion
-                dist_transform: np.ndarray = cv2.distanceTransform(mask_np, cv2.DIST_L2, 5)
-                expanded_mask_np = ((dist_transform > 0) | (dist_transform <= expand_pixels)).astype(np.uint8) * 255
-
-            # Apply feathering if requested
-            if feather_amount > 0:
-                feather_kernel_size: int = int(feather_amount * 2) * 2 + 1
-                expanded_mask_np = cv2.GaussianBlur(expanded_mask_np, (feather_kernel_size, feather_kernel_size), feather_amount)
-
-            # Convert back to tensor
-            expanded_mask: torch.Tensor = torch.from_numpy(expanded_mask_np.astype(np.float32) / 255.0)
-            expanded_mask = expanded_mask.to(mask.device)
-            expanded_masks.append(expanded_mask)
-
-        result: torch.Tensor = torch.stack(expanded_masks, dim=0)
         return (result,)

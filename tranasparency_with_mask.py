@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import torch
-import numpy as np
-from scipy.ndimage import gaussian_filter
 import torch.nn.functional as F
 from typing import Any
+
+from .gpu_ops import gpu_gaussian_blur
 
 
 class MaskToTransparentNode:
@@ -44,90 +44,67 @@ class MaskToTransparentNode:
             }
         }
 
+    @torch.inference_mode()
     def apply_transparency(self, image: torch.Tensor, mask: torch.Tensor, mask_threshold: float = 0.5, opacity_mode: str = "mask_as_opacity", feather: int = 0, invert_mask: bool = False) -> tuple[torch.Tensor]:
+        device: torch.device = image.device
+
+        if image.dim() == 3:
+            image = image.unsqueeze(0)
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(0)
+
+        batch_size: int = image.shape[0]
         mask_h: int = mask.shape[1]
         mask_w: int = mask.shape[2]
 
-        # Check if image needs resizing to match mask
+        # Resize image to match mask if needed
         if image.shape[1] != mask_h or image.shape[2] != mask_w:
-            image_resized: torch.Tensor = image.permute(0, 3, 1, 2)  # (B, H, W, C) -> (B, C, H, W)
+            image_resized: torch.Tensor = image.permute(0, 3, 1, 2)  # (B, C, H, W)
             image_resized = F.interpolate(image_resized, size=(mask_h, mask_w), mode='bilinear', align_corners=False)
-            image = image_resized.permute(0, 2, 3, 1)  # (B, C, H, W) -> (B, H, W, C)
+            image = image_resized.permute(0, 2, 3, 1)  # (B, H, W, C)
 
-        # Convert tensors to numpy arrays
-        img_np: np.ndarray = image.cpu().numpy()
-        mask_np: np.ndarray = mask.cpu().numpy()
+        # Broadcast single mask to batch if needed
+        if mask.shape[0] < batch_size:
+            mask = mask[0:1].expand(batch_size, -1, -1)
 
-        # Ensure correct dimensions
-        if len(img_np.shape) == 3:
-            img_np = np.expand_dims(img_np, 0)
-        batch_size: int = img_np.shape[0]
+        # Normalize mask to 0-1 range
+        msk_min: torch.Tensor = mask.amin(dim=(1, 2), keepdim=True)
+        msk_max: torch.Tensor = mask.amax(dim=(1, 2), keepdim=True)
+        denom: torch.Tensor = msk_max - msk_min
+        # Where range is zero, use a flat value based on the constant
+        mask_normalized: torch.Tensor = torch.where(
+            denom > 0,
+            (mask - msk_min) / denom.clamp(min=1e-7),
+            torch.where(msk_max > 0.5, torch.ones_like(mask), torch.zeros_like(mask))
+        )
 
-        # Handle mask dimensions
-        if len(mask_np.shape) == 2:
-            mask_np = np.expand_dims(np.expand_dims(mask_np, 0), -1)
-        elif len(mask_np.shape) == 3:
-            if mask_np.shape[0] != batch_size:
-                mask_np = np.expand_dims(mask_np, 0)
-            else:
-                mask_np = np.expand_dims(mask_np, -1)
+        # Invert if requested
+        if invert_mask:
+            mask_normalized = 1.0 - mask_normalized
 
-        # Process each image in batch
-        processed_images: list[np.ndarray] = []
+        # Apply opacity mode
+        alpha_mask: torch.Tensor
+        if opacity_mode == "threshold_cutout":
+            alpha_mask = (mask_normalized >= mask_threshold).float()
+        else:
+            alpha_mask = mask_normalized
 
-        for i in range(batch_size):
-            # Get current image and mask
-            img: np.ndarray = img_np[i]
-            msk: np.ndarray = mask_np[i] if i < mask_np.shape[0] else mask_np[0]
+        # Apply feathering using GPU gaussian blur
+        if feather > 0:
+            kernel_size: int = feather * 2 + 1
+            alpha_mask = gpu_gaussian_blur(alpha_mask, kernel_size, sigma=float(feather))
 
-            # Ensure mask is 2D and normalized
-            if len(msk.shape) == 3:
-                msk = msk[:, :, 0]
+        # Create RGBA image (B, H, W, 4)
+        num_channels: int = image.shape[-1]
+        rgba: torch.Tensor = torch.zeros(batch_size, mask_h, mask_w, 4, device=device, dtype=image.dtype)
+        rgba[..., :3] = image[..., :3]
 
-            # Normalize mask to 0-1 range if needed
-            msk_min: float = float(msk.min())
-            msk_max: float = float(msk.max())
-            if msk_max > msk_min:
-                msk = (msk - msk_min) / (msk_max - msk_min)
-            else:
-                msk = np.ones_like(msk) if msk_max > 0.5 else np.zeros_like(msk)
+        if num_channels == 4:
+            rgba[..., 3] = image[..., 3] * alpha_mask
+        else:
+            rgba[..., 3] = alpha_mask
 
-            # Invert mask if requested
-            if invert_mask:
-                msk = 1.0 - msk
-
-            # Apply opacity mode
-            alpha_mask: np.ndarray
-            if opacity_mode == "threshold_cutout":
-                alpha_mask = (msk >= mask_threshold).astype(np.float32)
-            else:
-                alpha_mask = msk
-
-            # Apply feathering if requested
-            if feather > 0:
-                alpha_mask = gaussian_filter(alpha_mask, sigma=feather)
-                alpha_mask = np.clip(alpha_mask, 0, 1)
-
-            # Create RGBA image
-            height: int = img.shape[0]
-            width: int = img.shape[1]
-
-            # Check if image already has alpha channel
-            rgba: np.ndarray
-            if img.shape[2] == 4:
-                rgba = img.copy()
-                rgba[:, :, 3] = rgba[:, :, 3] * alpha_mask
-            else:
-                rgba = np.zeros((height, width, 4), dtype=np.float32)
-                rgba[:, :, :3] = img[:, :, :3]
-                rgba[:, :, 3] = alpha_mask
-
-            processed_images.append(rgba)
-
-        # Convert back to tensor
-        output_images: np.ndarray = np.stack(processed_images)
-
-        return (torch.from_numpy(output_images),)
+        return (rgba,)
 
 
 class DebugMaskNode:
@@ -151,34 +128,21 @@ class DebugMaskNode:
             }
         }
 
+    @torch.inference_mode()
     def visualize_mask(self, mask: torch.Tensor, normalize: bool = True) -> tuple[torch.Tensor]:
-        # Convert tensor to numpy
-        mask_np: np.ndarray = mask.cpu().numpy()
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(0)
 
-        # Handle dimensions
-        if len(mask_np.shape) == 2:
-            mask_np = np.expand_dims(mask_np, 0)
-        if len(mask_np.shape) == 3:
-            batch_size: int = mask_np.shape[0]
-        else:
-            batch_size = mask_np.shape[0]
-            mask_np = mask_np[:, :, :, 0] if mask_np.shape[3] == 1 else mask_np[:, :, :, 0:1]
+        # If 4D, squeeze to 3D
+        if mask.dim() == 4:
+            mask = mask[:, :, :, 0]
 
-        images: list[np.ndarray] = []
+        if normalize:
+            msk_min: torch.Tensor = mask.amin(dim=(1, 2), keepdim=True)
+            msk_max: torch.Tensor = mask.amax(dim=(1, 2), keepdim=True)
+            denom: torch.Tensor = msk_max - msk_min
+            mask = torch.where(denom > 0, (mask - msk_min) / denom.clamp(min=1e-7), mask)
 
-        for i in range(batch_size):
-            msk: np.ndarray = mask_np[i] if len(mask_np.shape) == 3 else mask_np[i, :, :, 0]
-
-            # Normalize if requested
-            if normalize:
-                msk_min: float = float(msk.min())
-                msk_max: float = float(msk.max())
-                if msk_max > msk_min:
-                    msk = (msk - msk_min) / (msk_max - msk_min)
-
-            # Create RGB image from mask
-            rgb: np.ndarray = np.stack([msk, msk, msk], axis=2)
-            images.append(rgb)
-
-        output: np.ndarray = np.stack(images)
-        return (torch.from_numpy(output),)
+        # (B, H, W) → (B, H, W, 3)
+        image: torch.Tensor = mask.unsqueeze(-1).expand(-1, -1, -1, 3)
+        return (image,)

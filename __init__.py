@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from .fill_transparency_node import FillTransparencyNode
 from .mask_expand_border import MaskExpandBorder, MaskExpandBorderAdvanced
-from .mask_from_contour_node import MaskFromCounterOpenCV
+from .mask_from_contour_node import MaskFromCounterOpenCV, MaskFromCounter
 from .tranasparency_with_mask import MaskToTransparentNode, DebugMaskNode
 from .cutout_transparency_node import WhiteToTransparentNode, SimpleWhiteDetectorNode
 from .rgba_to_rgb_node import RGBAtoRGBNode
@@ -17,6 +17,7 @@ from .image_mask_convert_node import ImageToMaskNode, MaskToImageNode
 NODE_CLASS_MAPPINGS: dict[str, type] = {
     "FillTransparencyNode": FillTransparencyNode,
     "MaskFromContoursOpenCV": MaskFromCounterOpenCV,
+    "MaskFromContour": MaskFromCounter,
     "MaskToTransparentNode": MaskToTransparentNode,
     "DebugMaskNode": DebugMaskNode,
     "MaskExpandBorder": MaskExpandBorder,
@@ -39,6 +40,8 @@ NODE_DISPLAY_NAME_MAPPINGS: dict[str, str] = {
     "MaskExpandBorder": "Mask Expand Border",
     "MaskExpandBorderAdvanced": "Mask Expand Border (Advanced)",
     "MaskToTransparentNode": "Mask to Transparent",
+    "MaskFromContour": "Mask From Counter",
+    "MaskFromContoursOpenCV": "MaskFromCounterOpenCV",
     "DebugMaskNode": "Debug Mask Visualizer",
     "WhiteToTransparentNode": "White to Transparent",
     "SimpleWhiteDetectorNode": "White Detector",

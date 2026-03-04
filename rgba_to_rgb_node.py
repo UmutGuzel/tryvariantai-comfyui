@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import torch
-import numpy as np
 from typing import Any
 
 
@@ -38,65 +37,45 @@ class RGBAtoRGBNode:
             }
         }
 
+    @torch.inference_mode()
     def convert_to_rgb(self, image: torch.Tensor, background_color: str = "#FFFFFF", alpha_threshold: float = 0.0, threshold_mode: str = "composite") -> tuple[torch.Tensor, torch.Tensor]:
         device: torch.device = image.device
-        batch_size: int = image.shape[0]
 
-        # Parse background color
-        bg_color: list[float] = self._parse_color(background_color)
+        # Parse background color to [0, 1] tensor on device
+        bg_rgb: list[float] = self._parse_color(background_color)
+        bg_tensor: torch.Tensor = torch.tensor(bg_rgb, device=device, dtype=image.dtype).view(1, 1, 1, 3)
 
-        processed_images: list[torch.Tensor] = []
-        alpha_masks: list[torch.Tensor] = []
+        num_channels: int = image.shape[-1]
 
-        for i in range(batch_size):
-            img_tensor: torch.Tensor = image[i]
+        result: torch.Tensor
+        alpha_mask: torch.Tensor
 
-            # Convert to numpy
-            img_np: np.ndarray = img_tensor.cpu().numpy()
+        if num_channels == 4:
+            rgb: torch.Tensor = image[..., :3]
+            alpha: torch.Tensor = image[..., 3:4]
 
-            result: np.ndarray
-            alpha_mask: np.ndarray
-            if img_np.shape[2] == 4:
-                # RGBA image - composite over background
-                rgb: np.ndarray = img_np[:, :, :3]
-                alpha: np.ndarray = img_np[:, :, 3:4]
-
-                # Apply alpha threshold
-                alpha_thresholded: np.ndarray
-                if alpha_threshold > 0.0:
-                    if threshold_mode == "replace":
-                        alpha_thresholded = np.where(alpha >= alpha_threshold, 1.0, 0.0)
-                    else:  # composite mode
-                        alpha_thresholded = np.where(alpha >= alpha_threshold, alpha, 0.0)
-                else:
-                    alpha_thresholded = alpha
-
-                # Composite: result = foreground * alpha + background * (1 - alpha)
-                bg_array: np.ndarray = np.array(bg_color, dtype=np.float32).reshape(1, 1, 3)
-                result = rgb * alpha_thresholded + bg_array * (1 - alpha_thresholded)
-
-                # Store alpha mask (2D)
-                alpha_mask = alpha_thresholded.squeeze(-1)
-            elif img_np.shape[2] == 3:
-                # Already RGB, just pass through
-                result = img_np
-                # Create full opacity mask
-                alpha_mask = np.ones((img_np.shape[0], img_np.shape[1]), dtype=np.float32)
+            # Apply alpha threshold
+            alpha_t: torch.Tensor
+            if alpha_threshold > 0.0:
+                if threshold_mode == "replace":
+                    alpha_t = torch.where(alpha >= alpha_threshold, torch.ones_like(alpha), torch.zeros_like(alpha))
+                else:  # composite
+                    alpha_t = torch.where(alpha >= alpha_threshold, alpha, torch.zeros_like(alpha))
             else:
-                raise ValueError(f"Unsupported number of channels: {img_np.shape[2]}")
+                alpha_t = alpha
 
-            # Convert back to tensor
-            result_tensor: torch.Tensor = torch.from_numpy(result.astype(np.float32))
-            alpha_mask_tensor: torch.Tensor = torch.from_numpy(alpha_mask.astype(np.float32))
+            # Composite: result = foreground * alpha + background * (1 - alpha)
+            result = rgb * alpha_t + bg_tensor * (1.0 - alpha_t)
 
-            processed_images.append(result_tensor)
-            alpha_masks.append(alpha_mask_tensor)
+            # Alpha mask (B, H, W)
+            alpha_mask = alpha_t.squeeze(-1)
+        elif num_channels == 3:
+            result = image
+            alpha_mask = torch.ones(image.shape[0], image.shape[1], image.shape[2], device=device, dtype=image.dtype)
+        else:
+            raise ValueError(f"Unsupported number of channels: {num_channels}")
 
-        # Stack batch
-        output: torch.Tensor = torch.stack(processed_images, dim=0).to(device)
-        mask_output: torch.Tensor = torch.stack(alpha_masks, dim=0).to(device)
-
-        return (output, mask_output)
+        return (result, alpha_mask)
 
     def _parse_color(self, color_str: str) -> list[float]:
         """Parse hex color string to RGB values in range [0, 1]."""
@@ -112,5 +91,5 @@ class RGBAtoRGBNode:
                 return [r, g, b]
             else:
                 return [1.0, 1.0, 1.0]
-        except:
+        except (ValueError, IndexError):
             return [1.0, 1.0, 1.0]

@@ -58,6 +58,8 @@ class Base64DecodeNode:
             pil_image = pil_image.convert('RGB')
             img_np = np.array(pil_image)
 
+        pil_image.close()
+
         # Convert from uint8 [0, 255] to float [0, 1]
         img_np = img_np.astype(np.float32) / 255.0
 
@@ -79,12 +81,3 @@ class Base64DecodeNode:
             mask = 1.0 - mask
 
         return (img_tensor, mask)
-
-
-NODE_CLASS_MAPPINGS: dict[str, type] = {
-    "Base64DecodeNode": Base64DecodeNode
-}
-
-NODE_DISPLAY_NAME_MAPPINGS: dict[str, str] = {
-    "Base64DecodeNode": "Base64 Decode Image"
-}

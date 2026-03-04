@@ -1,3 +1,6 @@
-opencv-python==4.11.0.86
 opencv-python-headless==4.11.0.86
 transformers>=4.49.0
+segment-anything
+easydict
+timm>=0.5.4
+gdown

@@ -1,253 +1,326 @@
 from __future__ import annotations
 
-import torch
-import torch.nn.functional as F
-import numpy as np
-import cv2
-from PIL import Image
+import os
 from typing import Any
 
-# Module-level model cache for VitMatte
-_vitmatte_models: dict[str, tuple[Any, Any]] = {}
+import numpy as np
+import torch
+import torch.nn.functional as F
+from PIL import Image
+
+from .gpu_ops import gpu_dilate, gpu_erode
+
+
+def _get_device() -> torch.device:
+    import comfy.model_management as mm
+
+    return mm.get_torch_device()
+
+
+_vitmatte_model: tuple[Any, Any] | None = None
 
 
 class MaskMattingNode:
-    """
-    A ComfyUI node for GPU alpha matting / mask refinement.
-    Takes a coarse binary mask and original image, produces a refined soft alpha matte
-    with natural edges (hair, fur, semi-transparent areas).
+    """Refine a coarse mask into a soft alpha matte using VitMatte."""
 
-    Methods: vitmatte (best quality), guided_filter (fastest) — both run on GPU.
-    """
+    VITMATTE_ID = "hustvl/vitmatte-base-composition-1k"
 
-    VITMATTE_IDS: dict[str, str] = {
-        "small": "hustvl/vitmatte-small-composition-1k",
-        "base": "hustvl/vitmatte-base-composition-1k",
-    }
-
-    RETURN_TYPES: tuple[str, ...] = ("MASK", "IMAGE", "IMAGE")
-    RETURN_NAMES: tuple[str, ...] = ("alpha", "foreground", "trimap")
-    FUNCTION: str = "alpha_matting"
-    CATEGORY: str = "TryVariant.ai/mask"
-    DESCRIPTION: str = (
-        "GPU alpha matting: refine a coarse mask into a soft alpha matte. "
-        "vitmatte = best quality (deep learning), guided_filter = fastest (edge-aware smoothing). "
-        "Both run entirely on GPU."
+    RETURN_TYPES = ("MASK", "IMAGE", "IMAGE")
+    RETURN_NAMES = ("alpha", "foreground", "trimap")
+    FUNCTION = "alpha_matting"
+    CATEGORY = "TryVariant.ai/mask"
+    DESCRIPTION = (
+        "GPU alpha matting: refine a coarse mask into a soft alpha matte using VitMatte. "
+        "Removes background color bleed from edges automatically."
     )
 
     @classmethod
-    def INPUT_TYPES(cls) -> dict[str, Any]:
+    def INPUT_TYPES(cls):
         return {
             "required": {
                 "image": ("IMAGE",),
                 "mask": ("MASK",),
-                "method": (["vitmatte", "guided_filter"], {
-                    "default": "vitmatte"
-                }),
-                "trimap_erosion": ("INT", {
-                    "default": 10,
-                    "min": 1,
-                    "max": 100,
-                    "step": 1,
-                    "display": "number"
-                }),
-                "trimap_dilation": ("INT", {
-                    "default": 10,
-                    "min": 1,
-                    "max": 100,
-                    "step": 1,
-                    "display": "number"
-                }),
-                "trimap_kernel_shape": (["ellipse", "rectangle", "cross"], {
-                    "default": "ellipse"
-                }),
             },
             "optional": {
-                "vitmatte_model": (["small", "base"], {
-                    "default": "small"
-                }),
-                "guide_radius": ("INT", {
-                    "default": 8,
-                    "min": 1,
-                    "max": 64,
-                    "step": 1,
-                    "display": "number"
-                }),
-                "guide_epsilon": ("FLOAT", {
-                    "default": 0.02,
-                    "min": 0.0001,
-                    "max": 1.0,
-                    "step": 0.001,
-                    "display": "number"
-                }),
-                "estimate_foreground": ("BOOLEAN", {"default": False}),
+                "trimap_erosion": (
+                    "INT",
+                    {
+                        "default": 10,
+                        "min": 1,
+                        "max": 100,
+                        "step": 1,
+                        "display": "number",
+                    },
+                ),
+                "trimap_dilation": (
+                    "INT",
+                    {
+                        "default": 10,
+                        "min": 1,
+                        "max": 100,
+                        "step": 1,
+                        "display": "number",
+                    },
+                ),
+                "trimap_kernel_shape": (
+                    ["ellipse", "rectangle", "cross"],
+                    {"default": "ellipse"},
+                ),
+                "auto_scale_trimap": ("BOOLEAN", {"default": True}),
+                "bg_color": (["white", "black", "none"], {"default": "white"}),
                 "invert_mask": ("BOOLEAN", {"default": False}),
-            }
+            },
         }
 
-    def alpha_matting(self, image: torch.Tensor, mask: torch.Tensor, method: str, trimap_erosion: int, trimap_dilation: int,
-                      trimap_kernel_shape: str, vitmatte_model: str = "small", guide_radius: int = 8,
-                      guide_epsilon: float = 0.02, estimate_foreground: bool = False, invert_mask: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    @torch.inference_mode()
+    def alpha_matting(
+        self,
+        image: torch.Tensor,
+        mask: torch.Tensor,
+        trimap_erosion: int = 10,
+        trimap_dilation: int = 10,
+        trimap_kernel_shape: str = "ellipse",
+        auto_scale_trimap: bool = True,
+        bg_color: str = "white",
+        invert_mask: bool = False,
+    ):
 
-        device: torch.device = image.device
+        device = image.device
 
         if image.dim() == 3:
             image = image.unsqueeze(0)
         if mask.dim() == 2:
             mask = mask.unsqueeze(0)
 
-        batch_size: int = image.shape[0]
-        alpha_results: list[torch.Tensor] = []
-        fg_results: list[torch.Tensor] = []
-        trimap_results: list[torch.Tensor] = []
+        batch_size, img_h, img_w = image.shape[0], image.shape[1], image.shape[2]
+
+        if auto_scale_trimap:
+            scale = min(img_h, img_w) / 1024
+            trimap_erosion = max(1, round(trimap_erosion * scale))
+            trimap_dilation = max(1, round(trimap_dilation * scale))
+
+        alpha_out = torch.zeros(batch_size, img_h, img_w, device=device)
+        fg_out = torch.zeros(
+            batch_size, img_h, img_w, 3, device=device, dtype=image.dtype
+        )
+        trimap_out = torch.zeros(batch_size, img_h, img_w, 3, device=device)
 
         for i in range(batch_size):
-            img_np: np.ndarray = image[i].cpu().numpy()  # (H, W, C) float [0,1]
-            mask_np: np.ndarray = mask[i].cpu().numpy()   # (H, W) float [0,1]
+            img_i = image[i]
+            mask_i = mask[i]
 
-            img_h: int = img_np.shape[0]
-            img_w: int = img_np.shape[1]
-            mask_h: int = mask_np.shape[0]
-            mask_w: int = mask_np.shape[1]
-            if mask_h != img_h or mask_w != img_w:
-                mask_np = cv2.resize(mask_np, (img_w, img_h), interpolation=cv2.INTER_LINEAR)
+            if mask_i.shape[0] != img_h or mask_i.shape[1] != img_w:
+                mask_i = (
+                    F.interpolate(
+                        mask_i.unsqueeze(0).unsqueeze(0),
+                        size=(img_h, img_w),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    .squeeze(0)
+                    .squeeze(0)
+                )
 
             if invert_mask:
-                mask_np = 1.0 - mask_np
+                mask_i = 1.0 - mask_i
 
-            # Binarize and generate trimap
-            mask_binary: np.ndarray = (mask_np > 0.5).astype(np.uint8) * 255
-            trimap_np: np.ndarray = self._generate_trimap(
-                mask_binary, trimap_erosion, trimap_dilation, trimap_kernel_shape
+            trimap = self._generate_trimap_gpu(
+                mask_i, trimap_erosion, trimap_dilation, trimap_kernel_shape
             )
 
-            # Run matting
-            alpha_np: np.ndarray
-            if method == "vitmatte":
-                alpha_np = self._vitmatte_alpha(img_np, trimap_np, vitmatte_model)
-            else:
-                alpha_np = self._guided_filter_gpu(image[i], mask[i] if not invert_mask else 1.0 - mask[i],
-                                                   guide_radius, guide_epsilon, img_h, img_w)
+            alpha_np = self._vitmatte_alpha(img_i.cpu().numpy(), trimap.cpu().numpy())
+            alpha_tensor = torch.from_numpy(alpha_np).to(device).clamp(0.0, 1.0)
 
-            alpha_np = np.clip(alpha_np, 0.0, 1.0).astype(np.float32)
+            alpha_out[i] = alpha_tensor
+            fg_out[i] = self._decontaminate(img_i[..., :3], alpha_tensor, bg_color)
+            trimap_out[i] = trimap.unsqueeze(-1).expand(-1, -1, 3)
 
-            # Foreground estimation
-            fg_np: np.ndarray
-            if estimate_foreground:
-                alpha_3ch: np.ndarray = alpha_np[:, :, np.newaxis]
-                fg_np = (img_np[:, :, :3] * alpha_3ch).astype(np.float32)
-            else:
-                fg_np = img_np[:, :, :3].copy().astype(np.float32)
+        import comfy.model_management as mm
 
-            trimap_vis: np.ndarray = np.stack([trimap_np, trimap_np, trimap_np], axis=-1).astype(np.float32)
-
-            alpha_results.append(torch.from_numpy(alpha_np))
-            fg_results.append(torch.from_numpy(fg_np))
-            trimap_results.append(torch.from_numpy(trimap_vis))
-
-        alpha_out: torch.Tensor = torch.stack(alpha_results, dim=0).to(device)
-        fg_out: torch.Tensor = torch.stack(fg_results, dim=0).to(device)
-        trimap_out: torch.Tensor = torch.stack(trimap_results, dim=0).to(device)
-
+        mm.soft_empty_cache()
         return (alpha_out, fg_out, trimap_out)
 
-    def _generate_trimap(self, mask_uint8: np.ndarray, erosion_px: int, dilation_px: int, kernel_shape: str) -> np.ndarray:
-        """Generate trimap: white=foreground, black=background, gray=unknown."""
-        shape_map: dict[str, int] = {
-            "ellipse": cv2.MORPH_ELLIPSE,
-            "rectangle": cv2.MORPH_RECT,
-            "cross": cv2.MORPH_CROSS,
-        }
-        cv_shape: int = shape_map[kernel_shape]
+    def _generate_trimap_gpu(
+        self,
+        mask: torch.Tensor,
+        erosion_px: int,
+        dilation_px: int,
+        kernel_shape: str = "ellipse",
+    ) -> torch.Tensor:
+        """1.0=foreground, 0.0=background, 0.5=unknown."""
+        binary = (mask > 0.5).float().unsqueeze(0)
 
-        erode_kernel: np.ndarray = cv2.getStructuringElement(cv_shape, (erosion_px * 2 + 1, erosion_px * 2 + 1))
-        dilate_kernel: np.ndarray = cv2.getStructuringElement(cv_shape, (dilation_px * 2 + 1, dilation_px * 2 + 1))
+        fg_definite = gpu_erode(
+            binary, erosion_px, erosion_px, kernel_shape, iterations=1
+        )
+        bg_boundary = gpu_dilate(
+            binary, dilation_px, dilation_px, kernel_shape, iterations=1
+        )
 
-        fg_definite: np.ndarray = cv2.erode(mask_uint8, erode_kernel)
-        bg_boundary: np.ndarray = cv2.dilate(mask_uint8, dilate_kernel)
+        trimap = torch.full_like(binary, 0.5)
+        trimap[fg_definite > 0.5] = 1.0
+        trimap[bg_boundary < 0.5] = 0.0
 
-        trimap: np.ndarray = np.full(mask_uint8.shape, 0.5, dtype=np.float64)
-        trimap[fg_definite > 127] = 1.0
-        trimap[bg_boundary < 127] = 0.0
+        return trimap.squeeze(0)
 
-        return trimap
+    def _decontaminate(
+        self, rgb: torch.Tensor, alpha: torch.Tensor, bg_color: str
+    ) -> torch.Tensor:
+        """Remove background bleed from semi-transparent edge pixels (0.01 < alpha < 0.99).
+        Inverts alpha compositing: fg = (observed - bg * (1 - alpha)) / alpha
+        """
+        if bg_color == "none":
+            return rgb
 
-    def _vitmatte_alpha(self, image_np: np.ndarray, trimap_np: np.ndarray, model_size: str) -> np.ndarray:
-        """VitMatte alpha estimation on GPU — best quality."""
-        from transformers import VitMatteImageProcessor, VitMatteForImageMatting
-        global _vitmatte_models
+        alpha_3d = alpha.unsqueeze(-1)
+        is_boundary = (alpha_3d > 0.01) & (alpha_3d < 0.99)
+        safe_alpha = alpha_3d.clamp(min=0.01)
 
-        model_id: str = self.VITMATTE_IDS[model_size]
+        if bg_color == "white":
+            decontaminated = (rgb - 1.0 + alpha_3d) / safe_alpha
+        else:
+            decontaminated = rgb / safe_alpha
 
-        if model_size not in _vitmatte_models:
-            print(f"[MaskMatting] Loading VitMatte {model_size} from {model_id}...")
-            processor: Any = VitMatteImageProcessor.from_pretrained(model_id)
-            model: Any = VitMatteForImageMatting.from_pretrained(model_id)
-            model.to("cuda").eval()
-            _vitmatte_models[model_size] = (processor, model)
-            print(f"[MaskMatting] VitMatte {model_size} loaded on CUDA")
+        return torch.where(is_boundary, decontaminated, rgb).clamp(0.0, 1.0)
 
-        processor, model = _vitmatte_models[model_size]
+    def _vitmatte_alpha(
+        self, image_np: np.ndarray, trimap_np: np.ndarray
+    ) -> np.ndarray:
+        import glob
 
-        # Prepare PIL inputs
-        img_uint8: np.ndarray = (image_np[:, :, :3] * 255).astype(np.uint8)
-        pil_image: Image.Image = Image.fromarray(img_uint8, mode="RGB")
+        import comfy.utils
+        import folder_paths
+        from huggingface_hub import snapshot_download
+        from transformers import (
+            VitMatteConfig,
+            VitMatteForImageMatting,
+            VitMatteImageProcessor,
+        )
 
-        # Trimap: 0=bg, 128=unknown, 255=fg
-        trimap_uint8: np.ndarray = np.zeros(trimap_np.shape, dtype=np.uint8)
+        global _vitmatte_model
+
+        if _vitmatte_model is None:
+            # 1. Vendor config files to utils/vitmatte_lib
+            lib_path = os.path.join(os.path.dirname(__file__), "utils", "vitmatte_lib")
+
+            # 2. Setup ComfyUI models paths and search for weights
+            if "vitmatte" not in folder_paths.folder_names_and_paths:
+                folder_paths.add_model_folder_path(
+                    "vitmatte", os.path.join(folder_paths.models_dir, "vitmatte")
+                )
+
+            local_weight_dir = None
+            safetensors_file = None
+
+            for path in folder_paths.get_folder_paths("vitmatte"):
+                if os.path.exists(path):
+                    st_files = (
+                        glob.glob(os.path.join(path, "*.safetensors"))
+                        + glob.glob(os.path.join(path, "*.pth"))
+                        + glob.glob(os.path.join(path, "*.pt"))
+                    )
+                    if len(st_files) > 0:
+                        local_weight_dir = path
+                        safetensors_file = st_files[0]
+                        break
+
+            if safetensors_file is None:
+                target_base = folder_paths.get_folder_paths("vitmatte")[0]
+                local_weight_dir = target_base
+                print(f"[MaskMatting] Downloading weights to {local_weight_dir}...")
+                snapshot_download(
+                    repo_id=self.VITMATTE_ID,
+                    local_dir=local_weight_dir,
+                    local_dir_use_symlinks=False,
+                    allow_patterns=[
+                        "*.safetensors",
+                        "*.bin",
+                        "*.pth",
+                        "*.pt",
+                    ],
+                )
+                st_files = (
+                    glob.glob(os.path.join(local_weight_dir, "*.safetensors"))
+                    + glob.glob(os.path.join(local_weight_dir, "*.pth"))
+                    + glob.glob(os.path.join(local_weight_dir, "*.pt"))
+                    + glob.glob(os.path.join(local_weight_dir, "*.bin"))
+                )
+                if len(st_files) > 0:
+                    downloaded_file = st_files[0]
+                    resource_name = self.VITMATTE_ID.split("/")[-1]
+                    ext = os.path.splitext(downloaded_file)[1]
+                    new_file_path = os.path.join(
+                        local_weight_dir, f"{resource_name}{ext}"
+                    )
+
+                    if downloaded_file != new_file_path:
+                        if os.path.exists(new_file_path):
+                            os.remove(new_file_path)
+                        os.rename(downloaded_file, new_file_path)
+                        safetensors_file = new_file_path
+                    else:
+                        safetensors_file = downloaded_file
+
+                # HuggingFace creates a .cache folder when downloading to local_dir
+                # We delete it so the ComfyUI models folder stays clean.
+                cache_folder = os.path.join(local_weight_dir, ".cache")
+                if os.path.exists(cache_folder):
+                    import shutil
+
+                    shutil.rmtree(cache_folder, ignore_errors=True)
+
+            if safetensors_file is None:
+                raise FileNotFoundError(
+                    f"Could not find or download ViTMatte weights in {local_weight_dir}"
+                )
+
+            print(f"[MaskMatting] Instantiating architecture from: {lib_path}")
+            processor = VitMatteImageProcessor.from_pretrained(lib_path)
+            config = VitMatteConfig.from_pretrained(lib_path)
+            model = VitMatteForImageMatting(config)
+
+            print(f"[MaskMatting] Loading weights from: {safetensors_file}")
+            sd = comfy.utils.load_torch_file(safetensors_file)
+            model.load_state_dict(sd)
+
+            import comfy.model_management as mm
+
+            offload_device = mm.unet_offload_device()
+            model.to(offload_device).eval()
+            _vitmatte_model = (processor, model)
+            print(f"[MaskMatting] VitMatte loaded to offload device ({offload_device})")
+
+        import comfy.model_management as mm
+
+        device_to_use = mm.get_torch_device()
+        offload_device = mm.unet_offload_device()
+        processor, model = _vitmatte_model
+
+        # 1. Move model to GPU for inference
+        model.to(device_to_use)
+
+        img_uint8 = (image_np[:, :, :3] * 255).astype(np.uint8)
+        pil_image = Image.fromarray(img_uint8, mode="RGB")
+
+        trimap_uint8 = np.zeros(trimap_np.shape, dtype=np.uint8)
         trimap_uint8[trimap_np > 0.9] = 255
         trimap_uint8[(trimap_np >= 0.1) & (trimap_np <= 0.9)] = 128
-        pil_trimap: Image.Image = Image.fromarray(trimap_uint8, mode="L")
+        pil_trimap = Image.fromarray(trimap_uint8, mode="L")
 
-        inputs: dict[str, torch.Tensor] = processor(images=pil_image, trimaps=pil_trimap, return_tensors="pt")
-        inputs = {k: v.to("cuda") for k, v in inputs.items()}
+        inputs = processor(images=pil_image, trimaps=pil_trimap, return_tensors="pt")
 
-        with torch.no_grad():
-            alpha_tensor: torch.Tensor = model(**inputs).alphas
+        inputs = {k: v.to(device_to_use) for k, v in inputs.items()}
 
-        # Crop padded output to original size
-        orig_h: int = image_np.shape[0]
-        orig_w: int = image_np.shape[1]
-        alpha: np.ndarray = alpha_tensor[0, 0, :orig_h, :orig_w].cpu().numpy()
+        try:
+            with torch.inference_mode():
+                alpha_tensor = model(**inputs).alphas
+        finally:
+            # 2. Immediately offload model to free VRAM for other nodes
+            model.to(offload_device)
+            mm.soft_empty_cache()
 
+        del inputs
+
+        orig_h, orig_w = image_np.shape[0], image_np.shape[1]
+        alpha = alpha_tensor[0, 0, :orig_h, :orig_w].cpu().numpy()
         return np.clip(alpha, 0.0, 1.0).astype(np.float32)
-
-    def _guided_filter_gpu(self, image_tensor: torch.Tensor, mask_tensor: torch.Tensor, radius: int, epsilon: float, target_h: int, target_w: int) -> np.ndarray:
-        """GPU guided filter using PyTorch — fastest method."""
-        img: torch.Tensor = image_tensor[:, :, :3].to("cuda").float()
-        msk: torch.Tensor = mask_tensor.to("cuda").float()
-
-        # Resize mask if needed
-        if msk.shape[0] != target_h or msk.shape[1] != target_w:
-            msk = F.interpolate(
-                msk.unsqueeze(0).unsqueeze(0), size=(target_h, target_w),
-                mode="bilinear", align_corners=False
-            ).squeeze(0).squeeze(0)
-
-        # Grayscale guide
-        guide: torch.Tensor = 0.299 * img[:, :, 0] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 2]
-
-        # Reshape to (1, 1, H, W) for avg_pool2d
-        guide_4d: torch.Tensor = guide.unsqueeze(0).unsqueeze(0)
-        src_4d: torch.Tensor = msk.unsqueeze(0).unsqueeze(0)
-
-        ksize: int = 2 * radius + 1
-        pad: int = radius
-
-        mean_I: torch.Tensor = F.avg_pool2d(F.pad(guide_4d, [pad]*4, mode="reflect"), ksize, stride=1)
-        mean_p: torch.Tensor = F.avg_pool2d(F.pad(src_4d, [pad]*4, mode="reflect"), ksize, stride=1)
-        corr_Ip: torch.Tensor = F.avg_pool2d(F.pad(guide_4d * src_4d, [pad]*4, mode="reflect"), ksize, stride=1)
-        corr_II: torch.Tensor = F.avg_pool2d(F.pad(guide_4d * guide_4d, [pad]*4, mode="reflect"), ksize, stride=1)
-
-        var_I: torch.Tensor = corr_II - mean_I * mean_I
-        cov_Ip: torch.Tensor = corr_Ip - mean_I * mean_p
-
-        a: torch.Tensor = cov_Ip / (var_I + epsilon)
-        b: torch.Tensor = mean_p - a * mean_I
-
-        mean_a: torch.Tensor = F.avg_pool2d(F.pad(a, [pad]*4, mode="reflect"), ksize, stride=1)
-        mean_b: torch.Tensor = F.avg_pool2d(F.pad(b, [pad]*4, mode="reflect"), ksize, stride=1)
-
-        q: torch.Tensor = (mean_a * guide_4d + mean_b).squeeze(0).squeeze(0)
-
-        return torch.clamp(q, 0.0, 1.0).cpu().numpy().astype(np.float32)

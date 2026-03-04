@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import torch
-import numpy as np
 from PIL import ImageColor
 from typing import Any
 
@@ -38,51 +37,37 @@ class FillTransparencyNode:
             }
         }
 
+    @torch.inference_mode()
     def fill_transparency(self, image: torch.Tensor, mask: torch.Tensor | None = None, fill_color: str = "#FFFFFF") -> tuple[torch.Tensor]:
         batch_size: int = image.shape[0]
-        processed_images: list[torch.Tensor] = []
+        device: torch.device = image.device
 
         # Check if mask is valid (not 0x0 or 64x64)
         use_mask: bool = mask is not None and not self._is_invalid_mask(mask)
 
-        # Parse fill color
+        # Parse fill color to [0, 1] tensor on device
         fill_rgb: tuple[int, ...]
         try:
-            if isinstance(fill_color, str):
-                if fill_color.startswith('#'):
-                    fill_rgb = ImageColor.getrgb(fill_color)
-                else:
-                    fill_rgb = ImageColor.getrgb(fill_color)
-            else:
-                fill_rgb = (255, 255, 255)
+            fill_rgb = ImageColor.getrgb(fill_color) if isinstance(fill_color, str) else (255, 255, 255)
         except (ValueError, TypeError):
             fill_rgb = (255, 255, 255)
 
-        for i in range(batch_size):
-            img_tensor: torch.Tensor = image[i]  # (H, W, C)
+        fill_tensor: torch.Tensor = torch.tensor([fill_rgb[0] / 255.0, fill_rgb[1] / 255.0, fill_rgb[2] / 255.0], device=device, dtype=image.dtype)
 
-            if use_mask:
-                # Use provided mask
-                mask_tensor: torch.Tensor
-                if mask.shape[0] > 1:
-                    mask_tensor = mask[i]  # (H, W)
-                else:
-                    mask_tensor = mask[0]  # Single mask for all images
+        rgb: torch.Tensor = image[..., :3]  # (B, H, W, 3)
 
-                processed_img: torch.Tensor = self._fill_with_mask(img_tensor, mask_tensor, fill_rgb)
-            else:
-                # No valid mask - use alpha channel if available
-                if img_tensor.shape[2] == 4:
-                    # Extract alpha as mask
-                    alpha_mask: torch.Tensor = img_tensor[:, :, 3]
-                    processed_img = self._fill_with_alpha(img_tensor, alpha_mask, fill_rgb)
-                else:
-                    # No mask and no alpha - return as-is
-                    processed_img = img_tensor
+        if use_mask:
+            # Broadcast single mask to batch
+            msk: torch.Tensor = mask if mask.shape[0] > 1 else mask[0:1].expand(batch_size, -1, -1)
+            msk_3d: torch.Tensor = msk.unsqueeze(-1)  # (B, H, W, 1)
+            result: torch.Tensor = rgb * (1.0 - msk_3d) + fill_tensor * msk_3d
+        elif image.shape[-1] == 4:
+            alpha: torch.Tensor = image[..., 3:4]  # (B, H, W, 1)
+            fill_mask: torch.Tensor = 1.0 - alpha
+            result = rgb * alpha + fill_tensor * fill_mask
+        else:
+            result = rgb
 
-            processed_images.append(processed_img)
-
-        result: torch.Tensor = torch.stack(processed_images, dim=0)
         return (result,)
 
     def _is_invalid_mask(self, mask: torch.Tensor | None) -> bool:
@@ -93,58 +78,9 @@ class FillTransparencyNode:
         h: int = mask.shape[-2]
         w: int = mask.shape[-1]
 
-        # Check for 0x0
         if h == 0 or w == 0:
             return True
-
-        # Check for 64x64
         if h == 64 and w == 64:
             return True
 
         return False
-
-    def _fill_with_mask(self, img_tensor: torch.Tensor, mask_tensor: torch.Tensor, fill_color: tuple[int, ...]) -> torch.Tensor:
-        # Ensure RGB output
-        img_rgb: torch.Tensor
-        if img_tensor.shape[2] == 4:
-            img_rgb = img_tensor[:, :, :3]
-        else:
-            img_rgb = img_tensor
-
-        # Convert to numpy for processing
-        img_array: np.ndarray = img_rgb.cpu().numpy()  # (H, W, 3), values 0-1
-        mask_array: np.ndarray = mask_tensor.cpu().numpy()  # (H, W), values 0-1
-
-        # Normalize fill color to 0-1
-        fill_normalized: np.ndarray = np.array(fill_color[:3], dtype=np.float32) / 255.0
-
-        # Expand mask to 3 channels
-        mask_3d: np.ndarray = np.stack([mask_array] * 3, axis=2)
-
-        # Blend: where mask=1 use fill_color, where mask=0 use original
-        result: np.ndarray = img_array * (1 - mask_3d) + fill_normalized * mask_3d
-
-        # Convert back to tensor
-        result_tensor: torch.Tensor = torch.from_numpy(result.astype(np.float32))
-
-        return result_tensor
-
-    def _fill_with_alpha(self, img_tensor: torch.Tensor, alpha_mask: torch.Tensor, fill_color: tuple[int, ...]) -> torch.Tensor:
-        # Get RGB channels
-        img_rgb: np.ndarray = img_tensor[:, :, :3].cpu().numpy()
-        alpha_array: np.ndarray = alpha_mask.cpu().numpy()
-
-        # Normalize fill color
-        fill_normalized: np.ndarray = np.array(fill_color[:3], dtype=np.float32) / 255.0
-
-        # Where alpha is low (transparent), fill with color
-        fill_mask: np.ndarray = 1.0 - alpha_array
-        mask_3d: np.ndarray = np.stack([fill_mask] * 3, axis=2)
-
-        # Blend
-        result: np.ndarray = img_rgb * (1 - mask_3d) + fill_normalized * mask_3d
-
-        # Convert back to tensor
-        result_tensor: torch.Tensor = torch.from_numpy(result.astype(np.float32))
-
-        return result_tensor
