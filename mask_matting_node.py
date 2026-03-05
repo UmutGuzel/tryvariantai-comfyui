@@ -218,6 +218,7 @@ class MaskMattingNode:
                         glob.glob(os.path.join(path, "*.safetensors"))
                         + glob.glob(os.path.join(path, "*.pth"))
                         + glob.glob(os.path.join(path, "*.pt"))
+                        + glob.glob(os.path.join(path, "*.bin"))
                     )
                     if len(st_files) > 0:
                         local_weight_dir = path
