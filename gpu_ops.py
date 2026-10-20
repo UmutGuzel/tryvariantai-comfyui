@@ -54,6 +54,34 @@ def _make_gaussian_kernel_1d(kernel_size: int, sigma: float) -> torch.Tensor:
     return kernel
 
 
+def to_bhw_mask(mask: torch.Tensor) -> torch.Tensor:
+    """
+    Normalize a ComfyUI MASK-like tensor to (B, H, W).
+
+    Accepts (H, W), (B, H, W), (B, 1, H, W) and (B, H, W, 1). Older ComfyUI
+    builds (e.g. v0.21) and some upstream nodes hand over 4D masks; reading
+    dim 1 as height there yields a 1-pixel-tall mask and broadcast errors.
+    Multi-channel 4D inputs ((B, H, W, C) / (B, C, H, W), C in {3, 4}) use
+    channel 0.
+    """
+    if mask.dim() == 2:
+        return mask.unsqueeze(0)
+    if mask.dim() == 3:
+        return mask
+    if mask.dim() == 4:
+        if mask.shape[1] == 1:
+            return mask.squeeze(1)
+        if mask.shape[-1] == 1:
+            return mask.squeeze(-1)
+        if mask.shape[-1] in (3, 4):
+            return mask[..., 0]
+        if mask.shape[1] in (3, 4):
+            return mask[:, 0]
+    raise ValueError(
+        f"Unsupported mask shape {tuple(mask.shape)}; expected (H, W), (B, H, W), (B, 1, H, W) or (B, H, W, 1)"
+    )
+
+
 @torch.inference_mode()
 def gpu_gaussian_blur(mask: torch.Tensor, kernel_size: int, sigma: float = 0.0) -> torch.Tensor:
     """

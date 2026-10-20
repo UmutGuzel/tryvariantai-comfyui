@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from typing import Any
 
-from .gpu_ops import gpu_erode
+from .gpu_ops import gpu_erode, to_bhw_mask
 
 
 class MaskShrinkNode:
@@ -54,8 +54,7 @@ class MaskShrinkNode:
         if image is not None:
             mask = self._image_to_mask(image)
 
-        if mask.dim() == 2:
-            mask = mask.unsqueeze(0)
+        mask = to_bhw_mask(mask)
 
         result: torch.Tensor = gpu_erode(mask, shrink_pixels, shrink_pixels, kernel_shape, iterations)
         return (result,)

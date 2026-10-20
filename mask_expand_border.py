@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from typing import Any
 
-from .gpu_ops import gpu_dilate, gpu_gaussian_blur
+from .gpu_ops import gpu_dilate, gpu_gaussian_blur, to_bhw_mask
 
 
 class MaskExpandBorder:
@@ -43,8 +43,7 @@ class MaskExpandBorder:
 
     @torch.inference_mode()
     def expand_mask_border(self, mask: torch.Tensor, expand_pixels: int, iterations: int, kernel_shape: str) -> tuple[torch.Tensor]:
-        if mask.dim() == 2:
-            mask = mask.unsqueeze(0)
+        mask = to_bhw_mask(mask)
 
         result: torch.Tensor = gpu_dilate(mask, expand_pixels, expand_pixels, kernel_shape, iterations)
         return (result,)
@@ -90,8 +89,7 @@ class MaskExpandBorderAdvanced:
 
     @torch.inference_mode()
     def expand_mask_border_advanced(self, mask: torch.Tensor, expand_pixels: int, method: str, kernel_shape: str, feather_amount: float) -> tuple[torch.Tensor]:
-        if mask.dim() == 2:
-            mask = mask.unsqueeze(0)
+        mask = to_bhw_mask(mask)
 
         device: torch.device = mask.device
 

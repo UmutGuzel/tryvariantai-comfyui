@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import torch
+
+from .gpu_ops import to_bhw_mask
 from typing import Any
 
 
@@ -84,8 +86,7 @@ class MaskToImageNode:
 
     @torch.inference_mode()
     def mask_to_image(self, mask: torch.Tensor, invert: bool = False) -> tuple[torch.Tensor]:
-        if mask.dim() == 2:
-            mask = mask.unsqueeze(0)
+        mask = to_bhw_mask(mask)
 
         if invert:
             mask = 1.0 - mask

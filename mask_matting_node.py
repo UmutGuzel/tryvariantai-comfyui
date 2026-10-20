@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from .gpu_ops import gpu_dilate, gpu_erode
+from .gpu_ops import gpu_dilate, gpu_erode, to_bhw_mask
 
 
 def _get_device() -> torch.device:
@@ -89,8 +89,7 @@ class MaskMattingNode:
 
         if image.dim() == 3:
             image = image.unsqueeze(0)
-        if mask.dim() == 2:
-            mask = mask.unsqueeze(0)
+        mask = to_bhw_mask(mask)
 
         batch_size, img_h, img_w = image.shape[0], image.shape[1], image.shape[2]
 

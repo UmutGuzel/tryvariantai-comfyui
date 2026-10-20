@@ -1,6 +1,6 @@
 opencv-python-headless==4.11.0.86
 transformers>=4.49.0
-segment-anything
-easydict
 timm>=0.5.4
-gdown
+# Imported by the BiRefNet architecture code fetched at runtime (ComfyUI also installs them)
+kornia>=0.7.1
+einops

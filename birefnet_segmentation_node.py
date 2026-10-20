@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import glob
 import os
 from typing import Any
 
@@ -21,6 +22,12 @@ class BiRefNetSegmentationNode:
     """
 
     MODEL_ID: str = "ZhengPeng7/BiRefNet"
+    # Pinned commit of the Hugging Face repo. The architecture code (MIT, by the
+    # BiRefNet authors) and the weights are fetched from this revision at runtime
+    # into the ComfyUI models/birefnet folder, so this package ships none of it.
+    MODEL_REVISION: str = "e2bf8e4460fc8fa32bba5ea4d94b3233d367b0e4"
+    ARCH_FILES: tuple[str, ...] = ("birefnet.py", "BiRefNet_config.py", "config.json")
+    WEIGHT_GLOBS: tuple[str, ...] = ("*.safetensors", "*.pth", "*.pt")
 
     # ImageNet normalization constants
     _MEAN: list[float] = [0.485, 0.456, 0.406]
@@ -160,103 +167,108 @@ class BiRefNetSegmentationNode:
 
         return (pred_masks, rgba)
 
+    @classmethod
+    def _find_weights(cls, folder: str, include_bin: bool = False) -> str | None:
+        """First weight file in `folder` matching WEIGHT_GLOBS (plus *.bin on request)."""
+        if not os.path.isdir(folder):
+            return None
+        patterns = list(cls.WEIGHT_GLOBS) + (["*.bin"] if include_bin else [])
+        for pattern in patterns:
+            matches = sorted(glob.glob(os.path.join(folder, pattern)))
+            if matches:
+                return matches[0]
+        return None
+
     def _load_model(self) -> Any:
-        """Load BiRefNet architecture into node utilities, and weights from ComfyUI models."""
+        """Load BiRefNet from the ComfyUI models/birefnet folder.
+
+        Architecture files (ARCH_FILES) and weights live side by side in that folder.
+        Whatever is missing is fetched from MODEL_ID at MODEL_REVISION on first use.
+        """
         global _loaded_model
 
         if _loaded_model is not None:
             return _loaded_model
 
-        import glob
+        import shutil
 
+        import comfy.model_management
         import comfy.utils
         import folder_paths
         from huggingface_hub import snapshot_download
         from transformers import AutoConfig, AutoModelForImageSegmentation
 
-        # 1. Path to natively vendored architecture scripts
-        lib_path = os.path.join(os.path.dirname(__file__), "utils", "birefnet_lib")
-
-        # 2. Ensure birefnet is registered in ComfyUI paths for weights
         if "birefnet" not in folder_paths.folder_names_and_paths:
             folder_paths.add_model_folder_path(
                 "birefnet", os.path.join(folder_paths.models_dir, "birefnet")
             )
 
-        local_weight_dir = None
-        safetensors_file = None
-
-        # Check all registered birefnet paths for safetensors
+        # Prefer a registered folder that already holds weights; otherwise the first one.
+        model_dir: str | None = None
+        weight_file: str | None = None
         for path in folder_paths.get_folder_paths("birefnet"):
-            if os.path.exists(path):
-                st_files = (
-                    glob.glob(os.path.join(path, "*.safetensors"))
-                    + glob.glob(os.path.join(path, "*.pth"))
-                    + glob.glob(os.path.join(path, "*.pt"))
-                )
-                if len(st_files) > 0:
-                    local_weight_dir = path
-                    safetensors_file = st_files[0]
-                    break
+            found = self._find_weights(path)
+            if found is not None:
+                model_dir, weight_file = path, found
+                break
+        if model_dir is None:
+            model_dir = folder_paths.get_folder_paths("birefnet")[0]
 
-        # If not found, download weights to the first registered path
-        if safetensors_file is None:
-            target_base = folder_paths.get_folder_paths("birefnet")[0]
-            local_weight_dir = target_base
-            print(f"[BiRefNet] Downloading weights to {local_weight_dir}...")
+        missing_arch = [
+            name for name in self.ARCH_FILES if not os.path.isfile(os.path.join(model_dir, name))
+        ]
+        patterns: list[str] = list(missing_arch)
+        if weight_file is None:
+            patterns += list(self.WEIGHT_GLOBS) + ["*.bin"]
+
+        if patterns:
+            print(
+                f"[BiRefNet] Downloading {patterns} from {self.MODEL_ID}@{self.MODEL_REVISION[:7]} "
+                f"to {model_dir}..."
+            )
             snapshot_download(
                 repo_id=self.MODEL_ID,
-                local_dir=local_weight_dir,
+                revision=self.MODEL_REVISION,
+                local_dir=model_dir,
                 local_dir_use_symlinks=False,
-                allow_patterns=[
-                    "*.safetensors",
-                    "*.bin",
-                    "*.pth",
-                    "*.pt",
-                ],
+                allow_patterns=patterns,
             )
-            # Find the downloaded file
-            st_files = (
-                glob.glob(os.path.join(local_weight_dir, "*.safetensors"))
-                + glob.glob(os.path.join(local_weight_dir, "*.pth"))
-                + glob.glob(os.path.join(local_weight_dir, "*.pt"))
-                + glob.glob(os.path.join(local_weight_dir, "*.bin"))
-            )
-            if len(st_files) > 0:
-                downloaded_file = st_files[0]
-                resource_name = self.MODEL_ID.split("/")[-1]
-                ext = os.path.splitext(downloaded_file)[1]
-                new_file_path = os.path.join(local_weight_dir, f"{resource_name}{ext}")
-
-                if downloaded_file != new_file_path:
-                    if os.path.exists(new_file_path):
-                        os.remove(new_file_path)
-                    os.rename(downloaded_file, new_file_path)
-                    safetensors_file = new_file_path
-                else:
-                    safetensors_file = downloaded_file
-
-            # HuggingFace creates a .cache folder when downloading to local_dir
+            # HuggingFace creates a .cache folder when downloading to local_dir.
             # We delete it so the ComfyUI models folder stays clean.
-            cache_folder = os.path.join(local_weight_dir, ".cache")
-            if os.path.exists(cache_folder):
-                import shutil
+            shutil.rmtree(os.path.join(model_dir, ".cache"), ignore_errors=True)
 
-                shutil.rmtree(cache_folder, ignore_errors=True)
+        if weight_file is None:
+            weight_file = self._find_weights(model_dir, include_bin=True)
+            if weight_file is None:
+                raise FileNotFoundError(
+                    f"Could not find or download BiRefNet weights in {model_dir}"
+                )
+            # Rename the downloaded file (model.safetensors) to BiRefNet.<ext>
+            resource_name = self.MODEL_ID.split("/")[-1]
+            ext = os.path.splitext(weight_file)[1]
+            new_file_path = os.path.join(model_dir, f"{resource_name}{ext}")
+            if weight_file != new_file_path:
+                if os.path.exists(new_file_path):
+                    os.remove(new_file_path)
+                os.rename(weight_file, new_file_path)
+                weight_file = new_file_path
 
-        if safetensors_file is None:
+        still_missing = [
+            name for name in self.ARCH_FILES if not os.path.isfile(os.path.join(model_dir, name))
+        ]
+        if still_missing:
             raise FileNotFoundError(
-                f"Could not find or download BiRefNet weights in {local_weight_dir}"
+                f"BiRefNet architecture files missing in {model_dir}: {still_missing}"
             )
 
-        print(f"[BiRefNet] Instantiating architecture from: {lib_path}")
-        config = AutoConfig.from_pretrained(lib_path, trust_remote_code=True)
+        print(f"[BiRefNet] Instantiating architecture from: {model_dir}")
+        config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
         model = AutoModelForImageSegmentation.from_config(
             config, trust_remote_code=True
         )
 
-        print(f"[BiRefNet] Loading weights from: {safetensors_file}")
-        sd = comfy.utils.load_torch_file(safetensors_file)
+        print(f"[BiRefNet] Loading weights from: {weight_file}")
+        sd = comfy.utils.load_torch_file(weight_file)
         model.load_state_dict(sd)
 
         offload_device = comfy.model_management.unet_offload_device()

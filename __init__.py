@@ -12,7 +12,12 @@ from .mask_cleanup_node import MaskCleanupNode
 from .base64_decode_node import Base64DecodeNode
 from .mask_matting_node import MaskMattingNode
 from .birefnet_segmentation_node import BiRefNetSegmentationNode
+from .head_segmenter_node import HeadSegmenterNode
 from .image_mask_convert_node import ImageToMaskNode, MaskToImageNode
+from .image_packer_node import DynamicImagePacker
+from .batch_selector_node import BatchSelectorNode
+from .crop_with_mask_node import CropWithMaskNode
+from .controlnet_regional import ControlNetSafeRegion, ControlNetSafeRegionsCombine
 
 NODE_CLASS_MAPPINGS: dict[str, type] = {
     "FillTransparencyNode": FillTransparencyNode,
@@ -31,8 +36,14 @@ NODE_CLASS_MAPPINGS: dict[str, type] = {
     "Base64DecodeNode": Base64DecodeNode,
     "MaskMattingNode": MaskMattingNode,
     "BiRefNetSegmentationNode": BiRefNetSegmentationNode,
+    "HeadSegmenterNode": HeadSegmenterNode,
     "ImageToMaskNode": ImageToMaskNode,
     "MaskToImageNode": MaskToImageNode,
+    "DynamicImagePacker": DynamicImagePacker,
+    "BatchSelectorNode": BatchSelectorNode,
+    "CropWithMaskNode": CropWithMaskNode,
+    "ControlNetSafeRegion": ControlNetSafeRegion,
+    "ControlNetSafeRegionsCombine": ControlNetSafeRegionsCombine,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS: dict[str, str] = {
@@ -52,8 +63,14 @@ NODE_DISPLAY_NAME_MAPPINGS: dict[str, str] = {
     "Base64DecodeNode": "Base64 Decode Image",
     "MaskMattingNode": "Alpha Matting (Mask Refinement)",
     "BiRefNetSegmentationNode": "BiRefNet Segmentation",
+    "HeadSegmenterNode": "Head Segmenter (selfieseg)",
     "ImageToMaskNode": "Image to Mask",
     "MaskToImageNode": "Mask to Image",
+    "DynamicImagePacker": "Dynamic Image Packer",
+    "BatchSelectorNode": "Batch Selector Node",
+    "CropWithMaskNode": "Crop With Mask",
+    "ControlNetSafeRegion": "ControlNet-Safe Region",
+    "ControlNetSafeRegionsCombine": "ControlNet-Safe Regions Combine (1-4)",
 }
 
 

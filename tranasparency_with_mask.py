@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 from typing import Any
 
-from .gpu_ops import gpu_gaussian_blur
+from .gpu_ops import gpu_gaussian_blur, to_bhw_mask
 
 
 class MaskToTransparentNode:
@@ -50,8 +50,8 @@ class MaskToTransparentNode:
 
         if image.dim() == 3:
             image = image.unsqueeze(0)
-        if mask.dim() == 2:
-            mask = mask.unsqueeze(0)
+        # (B, H, W) regardless of whether upstream sent (H, W), (B, 1, H, W) or (B, H, W, 1)
+        mask = to_bhw_mask(mask).to(device=device)
 
         batch_size: int = image.shape[0]
         mask_h: int = mask.shape[1]
@@ -130,12 +130,7 @@ class DebugMaskNode:
 
     @torch.inference_mode()
     def visualize_mask(self, mask: torch.Tensor, normalize: bool = True) -> tuple[torch.Tensor]:
-        if mask.dim() == 2:
-            mask = mask.unsqueeze(0)
-
-        # If 4D, squeeze to 3D
-        if mask.dim() == 4:
-            mask = mask[:, :, :, 0]
+        mask = to_bhw_mask(mask)
 
         if normalize:
             msk_min: torch.Tensor = mask.amin(dim=(1, 2), keepdim=True)
